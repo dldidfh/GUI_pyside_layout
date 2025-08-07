@@ -1,44 +1,111 @@
+from __future__ import annotations
 
-from functools import partial
-from PySide6.QtWidgets import  QLabel, QWidget, QPushButton
-from PySide6.QtCore import QRect
-from config import * 
-from style.main_style import * 
-from controller.switcher import widget_switching
+import cv2
+from datetime import datetime
+from typing import List, Tuple
+
+from PySide6.QtCore import QThread, Signal, Qt, QTimer
+from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import QLabel, QWidget, QPushButton
+
+from config import WINDOW_SIZE, RTSP_URLS
+from database import DatabaseManager
+
+
+class DummyModel:
+    """Placeholder model. Replace with real implementation."""
+
+    def predict(self, image):
+        # TODO: replace with actual prediction logic
+        return "unknown", 0
+
+
+model = DummyModel()
+
+
+class VideoThread(QThread):
+    frame_received = Signal(object)
+
+    def __init__(self, rtsp_url: str):
+        super().__init__()
+        self.rtsp_url = rtsp_url
+        self._running = True
+
+    def run(self) -> None:
+        cap = cv2.VideoCapture(self.rtsp_url)
+        while self._running:
+            ret, frame = cap.read()
+            if ret:
+                self.frame_received.emit(frame)
+        cap.release()
+
+    def stop(self) -> None:
+        self._running = False
+
+
 class MainWidget(QWidget):
-    def __init__(self, parent, *args) -> None: # 상위 윈도우
+    def __init__(self, parent, *args) -> None:
         super().__init__(parent)
-        self.args = args
         self.main_window = parent
+        self.setGeometry(0, 0, WINDOW_SIZE[0], WINDOW_SIZE[1])
 
-        self.setGeometry(QRect(0,0,WINDOW_SIZE[0],WINDOW_SIZE[1]))
-        self.logo()
-        self.intro()
-        self.button()
+        self.db = DatabaseManager()
+        self.buffer: List[Tuple[int, str, datetime]] = []
 
-    def logo(self):
-        logo_label = QLabel(self)
-        logo_label.setText("qwe")
-        logo_label.setStyleSheet(LOGO_BACKGROUND_COLOR)
-        logo_label.setGeometry(QRect(0,0,WINDOW_SIZE[0],LOGO_FRAME_H))
+        self.labels: List[QLabel] = []
+        self.threads: List[VideoThread] = []
 
-    def intro(self):
-        logo_label = QLabel(self)
-        logo_label.setText("Intro")
-        logo_label.setStyleSheet(INTRO_BACKGROUND_COLOR)
-        logo_label.setGeometry(QRect(INTRO_X, INTRO_Y, INTRO_W, INTRO_H))
-    
-    def button(self):
-        # box_layout = QVBoxLayout(self)
-        box1 = QPushButton(self)
-        box1.setText('button1')
-        box1.setGeometry(QRect(BOX1_X, BOX1_Y, BOX1_W, BOX1_H))
-        box2 = QPushButton(self)
-        box2.setText('button2')
-        box2.setGeometry(QRect(BOX2_X, BOX2_Y, BOX2_W, BOX2_H))
-        box3 = QPushButton(self)
-        box3.setText('button3')
-        box3.setGeometry(QRect(BOX3_X, BOX3_Y, BOX3_W, BOX3_H))
+        self._setup_ui()
+        self._start_streams()
+        self._start_flush_timer()
 
-        box1.clicked.connect(partial(widget_switching, self.main_window, self, "settings_view", self.args))
+    def _setup_ui(self) -> None:
+        for idx in range(2):
+            label = QLabel(self)
+            label.setGeometry(10 + idx * (WINDOW_SIZE[0] // 2), 10, WINDOW_SIZE[0] // 2 - 20, WINDOW_SIZE[1] - 80)
+            label.setStyleSheet("background-color: black")
+            label.setAlignment(Qt.AlignCenter)
+            self.labels.append(label)
+
+        self.export_btn = QPushButton("Export", self)
+        self.export_btn.setGeometry(WINDOW_SIZE[0] - 110, 10, 100, 40)
+        self.export_btn.clicked.connect(self.export_data)
+
+    def _start_streams(self) -> None:
+        for idx, url in enumerate(RTSP_URLS[:2]):
+            thread = VideoThread(url)
+            thread.frame_received.connect(lambda frame, i=idx: self._update_frame(i, frame))
+            thread.start()
+            self.threads.append(thread)
+
+    def _start_flush_timer(self) -> None:
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.flush_buffer)
+        self.timer.start(60 * 1000)
+
+    def _update_frame(self, index: int, frame) -> None:
+        gender, age = model.predict(frame)
+        self.buffer.append((age, gender, datetime.now()))
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        pix = QPixmap.fromImage(image).scaled(self.labels[index].size(), Qt.KeepAspectRatio)
+        self.labels[index].setPixmap(pix)
+
+    def flush_buffer(self) -> None:
+        self.db.insert_records(self.buffer)
+        self.buffer.clear()
+
+    def export_data(self) -> None:
+        filename = f"result_{datetime.now():%Y%m%d}.xlsx"
+        self.db.export_last_year(filename)
+
+    def closeEvent(self, event) -> None:
+        for thread in self.threads:
+            thread.stop()
+            thread.wait()
+        self.db.close()
+        super().closeEvent(event)
 
